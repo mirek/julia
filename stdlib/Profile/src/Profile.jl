@@ -130,11 +130,14 @@ The keyword arguments can be any combination of:
 
  - `mincount` -- Limits the printout to only those lines with at least `mincount` occurrences.
 
- - `recur` -- Controls the recursion handling in `:tree` format. `off` (default) prints the tree as normal. `flat` instead
+ - `recur` -- Controls the recursion handling in `:tree` format. `:off` (default) prints the tree as normal. `:flat` instead
     compresses any recursion (by ip), showing the approximate effect of converting any self-recursion into an iterator.
-    `flatc` does the same but also includes collapsing of C frames (may do odd things around `jl_apply`).
+    `:flatc` does the same but also includes collapsing of C frames (may do odd things around `jl_apply`).
 """
-function print(io::IO, data::Vector{<:Unsigned} = fetch(), lidict::Union{LineInfoDict, LineInfoFlatDict} = getdict(data);
+function print(io::IO,
+        data::Vector{<:Unsigned} = fetch(),
+        lidict::Union{LineInfoDict, LineInfoFlatDict} = getdict(data)
+        ;
         format = :tree,
         C = false,
         combine = true,
@@ -484,7 +487,7 @@ function indent(depth::Int)
     return (indent_s^div) * SubString(indent_s, 1, indent_z[rem])
 end
 
-function tree_format(lilist::Vector{StackFrame}, counts::Vector{Int}, level::Int, cols::Int)
+function tree_format(lilist::Vector{StackFrame}, counts::Vector{Int}, level::Int, cols::Int, showpointer::Bool)
     nindent = min(cols>>1, level)
     ndigcounts = ndigits(maximum(counts))
     ndigline = maximum([tree_format_linewidth(x) for x in lilist])
@@ -513,9 +516,17 @@ function tree_format(lilist::Vector{StackFrame}, counts::Vector{Int}, level::Int
                     string(li.pointer, base = 16, pad = 2*sizeof(Ptr{Cvoid})),
                     ")")
             else
-                fname = string(li.func)
                 if !li.from_c && li.linfo !== nothing
                     fname = sprint(show_spec_linfo, li)
+                else
+                    fname = string(li.func)
+                end
+                if showpointer
+                    fname = string(
+                        "0x",
+                        string(li.pointer, base = 16, pad = 2*sizeof(Ptr{Cvoid})),
+                        " ",
+                        fname)
                 end
                 strs[i] = string(base,
                     rpad(string(counts[i]), ndigcounts, " "),
@@ -539,7 +550,7 @@ mutable struct StackFrameTree{T} # where T <: Union{UInt64, StackFrame}
     frame::StackFrame
     count::Int
     down::Dict{T, StackFrameTree{T}}
-    # construction helpers:
+    # construction workers:
     recur::Bool
     builder_key::Vector{UInt64}
     builder_value::Vector{StackFrameTree{T}}
@@ -560,10 +571,7 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
             else
                 # We mark all visited nodes to so we'll only count those branches
                 # once for each backtrace. Reset that now for the next backtrace.
-                while parent != root
-                    parent.recur = false
-                    parent = parent.up
-                end
+                push!(tops, parent)
                 for top in tops
                     while top.recur
                         top.recur = false
@@ -571,22 +579,10 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
                     end
                 end
                 empty!(tops)
+                parent = root
             end
             parent.count += 1
         else
-            if recur === :flat || recur == :flatc
-                # Rewind the `parent` tree back, if this ip was already present
-                let this = parent
-                    while this !== root && this.frame.pointer !== ip
-                        this = this.up
-                    end
-                    if this !== root && (recur === :flatc || !this.frame.from_c)
-                        push!(tops, parent)
-                        parent = this
-                        continue
-                    end
-                end
-            end
             builder_key = parent.builder_key
             builder_value = parent.builder_value
             fastkey = searchsortedfirst(parent.builder_key, ip)
@@ -610,6 +606,24 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
             end
             frames = lidict[ip]
             nframes = (frames isa Vector ? length(frames) : 1)
+            if recur === :flat || recur == :flatc
+                # Rewind the `parent` tree back, if this ip was already present *higher* in the current tree
+                let this, frame, key
+                    this = parent
+                    frame = (frames isa Vector ? frames[1] : frames)
+                    if recur === :flatc || !frame.from_c
+                        key = (T === UInt64 ? ip : frame)
+                        while this !== root && (T === UInt64 ? this.frame.pointer : this.frame) != key
+                            this = this.up
+                        end
+                        if this !== root
+                            push!(tops, parent)
+                            parent = this
+                            continue
+                        end
+                    end
+                end
+            end
             this = parent
             # add all the inlining frames
             for i = nframes:-1:1
@@ -645,25 +659,9 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
     return root
 end
 
-function tree_combine(root::StackFrameTree{UInt64})
-    combined = StackFrameTree{StackFrame}()
-    stack = [(root, combined)]
-    while !isempty(stack)
-        old, new = pop!(stack)
-        new.frame = old.frame
-        new.count += old.count
-        for down in values(old.down)
-            this = get!(StackFrameTree{StackFrame}, new.down, down.frame)
-            this.up = new
-            push!(stack, (down, this))
-        end
-    end
-    return combined
-end
-
 # Print the stack frame tree starting at a particular root. Uses a worklist to
 # avoid stack overflows.
-function tree(io::IO, bt::StackFrameTree, cols::Int, fmt::ProfileFormat)
+function print_tree(io::IO, bt::StackFrameTree{T}, cols::Int, fmt::ProfileFormat) where T
     worklist = [(bt, 0, 0, "")]
     while !isempty(worklist)
         (bt, level, noisefloor, str) = popfirst!(worklist)
@@ -675,7 +673,7 @@ function tree(io::IO, bt::StackFrameTree, cols::Int, fmt::ProfileFormat)
         lilist = collect(frame.frame for frame in nexts)
         counts = collect(frame.count for frame in nexts)
         # Generate the string for each line
-        strs = tree_format(lilist, counts, level, cols)
+        strs = tree_format(lilist, counts, level, cols, T === UInt64)
         # Recurse to the next level
         for i in reverse(liperm(lilist))
             down = nexts[i]
@@ -691,7 +689,7 @@ function tree(io::IO, bt::StackFrameTree, cols::Int, fmt::ProfileFormat)
 end
 
 function tree(io::IO, data::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, cols::Int, fmt::ProfileFormat)
-    if fmt.combine && fmt.recur === :off
+    if fmt.combine
         root = tree!(StackFrameTree{StackFrame}(), data, lidict, fmt.C, fmt.recur)
     else
         root = tree!(StackFrameTree{UInt64}(), data, lidict, fmt.C, fmt.recur)
@@ -700,10 +698,8 @@ function tree(io::IO, data::Vector{UInt64}, lidict::Union{LineInfoFlatDict, Line
         warning_empty()
         return
     end
-    if fmt.combine && root isa StackFrameTree{UInt64}
-        root = tree_combine(root)
-    end
-    tree(io, root, cols, fmt)
+    print_tree(io, root, cols, fmt)
+    Base.println(io, "Total snapshots: ", root.count)
     nothing
 end
 
