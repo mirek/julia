@@ -583,9 +583,28 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
             end
             parent.count += 1
         else
+            if recur === :flat || recur == :flatc
+                # Rewind the `parent` tree back, if this exact ip was already present *higher* in the current tree
+                let this = parent
+                    while this !== root
+                        builder_key = this.up.builder_key
+                        builder_value = this.up.builder_value
+                        fastkey = searchsortedfirst(builder_key, ip)
+                        if fastkey < length(builder_key) && builder_key[fastkey] === ip && builder_value[fastkey] === this
+                            break
+                        end
+                        this = this.up
+                    end
+                    if this !== root || !this.frame.from_c
+                        push!(tops, parent)
+                        parent = this
+                        continue
+                    end
+                end
+            end
             builder_key = parent.builder_key
             builder_value = parent.builder_value
-            fastkey = searchsortedfirst(parent.builder_key, ip)
+            fastkey = searchsortedfirst(builder_key, ip)
             if fastkey < length(builder_key) && builder_key[fastkey] === ip
                 # jump forward to the end of the inlining chain
                 # avoiding an extra (slow) lookup of `ip` in `lidict`
@@ -606,24 +625,6 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
             end
             frames = lidict[ip]
             nframes = (frames isa Vector ? length(frames) : 1)
-            if recur === :flat || recur == :flatc
-                # Rewind the `parent` tree back, if this ip was already present *higher* in the current tree
-                let this, frame, key
-                    this = parent
-                    frame = (frames isa Vector ? frames[1] : frames)
-                    if recur === :flatc || !frame.from_c
-                        key = (T === UInt64 ? ip : frame)
-                        while this !== root && (T === UInt64 ? this.frame.pointer : this.frame) != key
-                            this = this.up
-                        end
-                        if this !== root
-                            push!(tops, parent)
-                            parent = this
-                            continue
-                        end
-                    end
-                end
-            end
             this = parent
             # add all the inlining frames
             for i = nframes:-1:1
