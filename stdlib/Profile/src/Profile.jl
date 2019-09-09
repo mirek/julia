@@ -562,13 +562,14 @@ end
 function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineInfoFlatDict, LineInfoDict}, C::Bool, recur::Symbol) where {T}
     parent = root
     tops = Vector{StackFrameTree{T}}()
-    for i in length(all):-1:1
+    build = Vector{StackFrameTree{T}}()
+    startframe = length(all)
+    for i in startframe:-1:1
         ip = all[i]
         if ip == 0
             # sentinel value indicates the start of a new backtrace
-            if recur === :off
-                parent = root
-            else
+            empty!(build)
+            if recur !== :off
                 # We mark all visited nodes to so we'll only count those branches
                 # once for each backtrace. Reset that now for the next backtrace.
                 push!(tops, parent)
@@ -579,28 +580,29 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
                     end
                 end
                 empty!(tops)
-                parent = root
             end
+            parent = root
             parent.count += 1
+            startframe = i
         else
+            pushfirst!(build, parent)
             if recur === :flat || recur == :flatc
                 # Rewind the `parent` tree back, if this exact ip was already present *higher* in the current tree
-                let this = parent
-                    while this !== root
-                        builder_key = this.up.builder_key
-                        builder_value = this.up.builder_value
-                        fastkey = searchsortedfirst(builder_key, ip)
-                        if fastkey < length(builder_key) && builder_key[fastkey] === ip && builder_value[fastkey] === this
-                            break
+                found = false
+                for j in 1:(startframe - i)
+                    if ip == all[i + j]
+                        if recur === :flat # if not flattening C frames, check that now
+                            frames = lidict[ip]
+                            frame = (frames isa Vector ? frames[1] : frames)
+                            frame.from_c && break
                         end
-                        this = this.up
-                    end
-                    if this !== root || !this.frame.from_c
                         push!(tops, parent)
-                        parent = this
-                        continue
+                        parent = build[j]
+                        found = true
+                        break
                     end
                 end
+                found && continue
             end
             builder_key = parent.builder_key
             builder_value = parent.builder_value
@@ -613,7 +615,7 @@ function tree!(root::StackFrameTree{T}, all::Vector{UInt64}, lidict::Union{LineI
                 this = builder_value[fastkey]
                 let this = this
                     if recur === :off || !this.recur
-                        while this !== parent
+                        while this !== parent && !this.recur
                             this.count += 1
                             this.recur = true
                             this = this.up
