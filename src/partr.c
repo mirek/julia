@@ -321,6 +321,7 @@ JL_DLLEXPORT int jl_enqueue_task(jl_task_t *task)
 //  sleep_check_after_threshold() -- if sleep_threshold ns have passed, return 1
 static int sleep_check_after_threshold(uint64_t *start_cycles)
 {
+    return 1;
     JULIA_DEBUG_SLEEPWAKE( return 1 ); // hammer on the sleep/wake logic much harder
     if (!(*start_cycles)) {
         *start_cycles = jl_hrtime();
@@ -338,7 +339,7 @@ static int sleep_check_after_threshold(uint64_t *start_cycles)
 static void wake_thread(int16_t tid)
 {
     jl_ptls_t other = jl_all_tls_states[tid];
-    if (jl_atomic_load(&other->sleep_check_state) != not_sleeping) {
+    if (1 /*jl_atomic_load(&other->sleep_check_state) != not_sleeping*/) {
         int16_t state = jl_atomic_exchange(&other->sleep_check_state, not_sleeping); // prohibit it from sleeping
         if (state == sleeping) { // see if it was possibly sleeping before now
             uv_mutex_lock(&other->sleep_lock);
@@ -375,8 +376,8 @@ JL_DLLEXPORT void jl_wakeup_thread(int16_t tid)
         // something added to the sticky-queue: notify that thread
         wake_thread(tid);
         // check if we need to notify uv_run too
-        /*unsigned long system_tid = jl_all_tls_states[tid]->system_id;*/
-        if (uvlock != system_self /*TODO: && jl_atomic_load(&jl_uv_mutex.owner) == system_tid*/)
+        unsigned long system_tid = jl_all_tls_states[tid]->system_id;
+        if (uvlock != system_self && jl_atomic_load(&jl_uv_mutex.owner) == system_tid)
             wake_libuv();
     }
     // check if the other threads might be sleeping
@@ -391,7 +392,7 @@ JL_DLLEXPORT void jl_wakeup_thread(int16_t tid)
                     if (tid != self)
                         wake_thread(tid);
                 // check if we need to notify uv_run too
-                if (uvlock != system_self /*TODO: && jl_atomic_load(&jl_uv_mutex.owner) != 0*/)
+                if (uvlock != system_self && jl_atomic_load(&jl_uv_mutex.owner) != 0)
                     wake_libuv();
             }
         }
